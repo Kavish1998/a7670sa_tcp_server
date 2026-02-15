@@ -2,15 +2,17 @@
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 
-#define MODEM_PWRKEY  14
-#define MODEM_RX      25
-#define MODEM_TX      26
-#define MODEM_BAUD    115200
+// ----------------- PINS / UART -----------------
+#define MODEM_PWRKEY 14
+#define MODEM_RX     25
+#define MODEM_TX     26
+#define MODEM_BAUD   115200
 
-#define METER_BAUD    115200
-#define METER_RXD2 32
-#define METER_TXD2 33
+#define METER_RXD2   32
+#define METER_TXD2   33
+#define METER_BAUD   2400
 
+// ----------------- CONFIG -----------------
 #define ENABLE_DEBUG_LOG 1
 #define WDT_TIMEOUT 3600
 
@@ -19,37 +21,44 @@
 
 #define BUFFER_SIZE 1024
 
-const int baudrate = 115200;
-const int rs_config = SERIAL_8N1;
+static byte buff[BUFFER_SIZE];
 
-byte buff[BUFFER_SIZE];
+static bool bridgeOn = false;
+static String urcLine;  // command-mode URC line buffer
 
-void debug_log(String s)
+// ----------------- LOG -----------------
+void debug_log(const String &s)
 {
 #if ENABLE_DEBUG_LOG
   Serial.println(s);
 #endif
 }
 
-String sendAT(String cmd, uint32_t wait = 3000)
+// ----------------- AT (COMMAND MODE ONLY) -----------------
+String sendAT(const String &cmd, uint32_t wait = 3000)
 {
   Serial1.println(cmd);
-  debug_log(">> " + cmd);
+#if ENABLE_DEBUG_LOG
+  Serial.println(">> " + cmd);
+#endif
 
-  String resp = "";
+  String resp;
   uint32_t t = millis();
-
   while (millis() - t < wait)
   {
     while (Serial1.available())
       resp += char(Serial1.read());
+    delay(2);
+    esp_task_wdt_reset();
   }
 
-  debug_log(resp);
+#if ENABLE_DEBUG_LOG
+  if (resp.length()) Serial.println(resp);
+#endif
   return resp;
 }
 
-
+// ----------------- MODEM POWER -----------------
 void modemPowerOn()
 {
   pinMode(MODEM_PWRKEY, OUTPUT);
@@ -60,171 +69,200 @@ void modemPowerOn()
   delay(1000);
   digitalWrite(MODEM_PWRKEY, LOW);
 
-  delay(10000); // LTE boot time
+  delay(10000);
 }
 
-bool waitSIM()
-{
-  for (int i = 0; i < 20; i++)
-  {
-    String r = sendAT("AT+CPIN?", 1000);
-    if (r.indexOf("READY") >= 0)
-      return true;
-
-    delay(1000);
-  }
-  return false;
-}
-
-// bool waitNetwork()
-// {
-//   for (int i = 0; i < 40; i++)
-//   {
-//     String r = sendAT("AT+CREG?", 2000);
-
-//     if (r.indexOf(",1") >= 0 || r.indexOf(",5") >= 0)
-//       return true;
-
-//     delay(2000);
-//   }
-//   return false;
-// }
-
+// ----------------- INIT -----------------
 bool modemInit()
 {
   sendAT("AT");
-  sendAT("AT&W");
+  sendAT("ATE0"); // echo off
   sendAT("AT+CSQ");
-  // sendAT("AT+CFUN=0", 2000);
-  // sendAT("AT+CFUN=1", 5000);
+  sendAT("AT+CREG?");
+  sendAT("AT+CNMP=13"); // auto
+  sendAT("AT+CGDCONT=1,\"IP\",\"" APN "\"");
 
-    sendAT("AT+CREG?");
-
-  if (!waitSIM())
+  String r = sendAT("AT+NETOPEN", 15000);
+  if (r.indexOf("OK") < 0 && r.indexOf("NETOPEN: 0") < 0)
   {
-    debug_log("SIM NOT READY");
+    debug_log("NETOPEN failed");
     return false;
   }
 
-  // sendAT("AT+CNMP=38");   // LTE only
-  // sendAT("AT+CMNB=1");    // CAT-1
-  // sendAT("AT+CNMP=13");   // GSM only
+  sendAT("AT+IPADDR", 5000);
 
-  sendAT("AT+CNMP=13");   // Auto GSM/LTE
+  sendAT("AT+NETCLOSE=1");
 
+  // Transparent TCP
+  sendAT("AT+CIPMODE=1");
 
-
-  sendAT("AT+CPSI?");
-
-  // if (!waitNetwork())
-  // {
-  //   debug_log("NETWORK REGISTER FAIL");
-  //   return false;
-  // }
- sendAT("AT+CGDCONT=1," APN "\"");
- sendAT("AT+NETOPEN", 1000);
- sendAT("AT+IPADDR");
-
-sendAT("AT+NETCLOSE=1");
-
-// Open network stack
-sendAT("AT+CIPMODE=1");
-
- sendAT("AT+NETOPEN");
-// // 1. Open network
-// if (sendAT("AT+NETOPEN", 10000).indexOf("OK") < 0)
-// {
-//     debug_log("NET OPEN FAIL");
-//     return false;
-// }
+  sendAT("AT+NETOPEN=1");
 
 
+  // Start server
   String cmd = "AT+SERVERSTART=" + String(TCP_PORT) + ",0";
-
-  if (sendAT(cmd, 10000).indexOf("OK") < 0)
+  r = sendAT(cmd, 10000);
+  if (r.indexOf("OK") < 0)
+  {
+    debug_log("SERVERSTART failed");
     return false;
+  }
 
   debug_log("TCP SERVER READY");
   return true;
-
-}
-void enableTransparentMode() {
-  debug_log("Enable transparent mode...");
-  delay(1000);
-  sendAT("ATE0");      // optional: echo off
 }
 
-void exitTransparentMode() {
-  debug_log("Exiting transparent mode...");
-  delay(1000);
-  Serial1.write("+++");  // no newline, just the 3 characters
+// Enter transparent mode (only once per connection)
+void enterTransparent()
+{
+  debug_log("BRIDGE ON (no ATO)");
+  //sendAT("ATO", 2000);
+  delay(300);
 }
 
+bool isConnectURC(const String &line)
+{
+  if (line.indexOf("RECV FROM:") >= 0) return true;
+  if (line.indexOf("+CLIENT:") >= 0) return true;
+  if (line.indexOf("CONNECT") >= 0)  return true;
+  return false;
+}
+
+bool isDisconnectURC(const String &line)
+{
+  if (line.indexOf("CLOSED") >= 0)      return true;
+  if (line.indexOf("NO CARRIER") >= 0)  return true;
+  if (line.indexOf("+IPCLOSE") >= 0)    return true;
+  if (line.indexOf("+CIPCLOSE") >= 0)   return true;
+  if (line.indexOf("CLOSE") >= 0)       return true; 
+  return false;
+}
+
+int pollModemURC_CommandMode()
+{
+  while (Serial1.available())
+  {
+    char c = (char)Serial1.read();
+    if (c == '\r') continue;
+    urcLine += c;
+
+    if (c == '\n')
+    {
+      String line = urcLine;
+      urcLine = "";
+      line.trim();
+
+#if ENABLE_DEBUG_LOG
+      if (line.length()) Serial.println("[URC] " + line);
+#endif
+
+      if (isConnectURC(line)) return 1;
+      if (isDisconnectURC(line)) return -1;
+    }
+  }
+  return 0;
+}
+
+bool bridgeReadFromModem_ToMeter(bool &disconnectSeen)
+{
+  disconnectSeen = false;
+
+  static bool droppingLine = false;
+  static int matchIdx = 0;
+  static const char *HDR = "RECV FROM:";
+
+  while (Serial1.available() > 0)
+  {
+    int c = Serial1.read();
+    if (c < 0) break;
+
+    if (droppingLine)
+    {
+      if (c == '\n')
+      {
+        droppingLine = false;
+        matchIdx = 0;
+      }
+      continue;
+    }
+
+    if (c == HDR[matchIdx])
+    {
+      matchIdx++;
+      if (HDR[matchIdx] == '\0')
+      {
+        droppingLine = true;
+        matchIdx = 0;
+      }
+      continue; 
+    }
+    else
+    {
+      matchIdx = 0;
+    }
+    byte b = (byte)c;
+    Serial2.write(&b, 1);
+  }
+
+  return true;
+}
 void setup()
 {
-  Serial.begin(baudrate, rs_config);
+  Serial.begin(115200);
   Serial1.begin(MODEM_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
   Serial2.begin(METER_BAUD, SERIAL_8N1, METER_RXD2, METER_TXD2);
+
   esp_task_wdt_init(WDT_TIMEOUT, true);
   esp_task_wdt_add(NULL);
+
   delay(2000);
   modemPowerOn();
 
   if (!modemInit())
   {
-   debug_log("MODEM INIT FAILED");
-    while (1);
+    debug_log("MODEM INIT FAIL -> reboot");
+    delay(1000);
+    ESP.restart();
   }
 }
 
-int parseBytes(String resp) {
-  int idx = resp.indexOf(',');
-  if (idx < 0) return 0;  
-  String numStr = resp.substring(idx + 1);
-  numStr.trim();           
-  return numStr.toInt();  
-}
-
-bool clientConnected()
-{
-  static bool connected = false;
-
-  while (Serial1.available())
-  {
-    String line = Serial1.readStringUntil('\n');
-    line.trim();
-    debug_log("MODEM: " + line);
-
-    if (line.indexOf("+CLIENT:") >= 0)
-    {
-      debug_log("CLIENT CONNECTED");
-      connected = true;
-      return true;
-    }
-  }
-  connected = false;
-
-  return false;
-}
 void loop()
 {
   esp_task_wdt_reset();
 
-  if (!clientConnected())
+  // -------- WAIT FOR CLIENT --------
+  if (!bridgeOn)
+  {
+    int ev = pollModemURC_CommandMode();
+    if (ev == 1)
+    {
+      debug_log("CLIENT CONNECTED -> BRIDGE ON");
+      enterTransparent();
+      bridgeOn = true;
+    }
+    delay(10);
     return;
-  
-  debug_log("client found");
-
- 
-  // Forward data: GSM -> Serial2
-  while (Serial1.available()) {
-    Serial2.write(Serial1.read());
   }
 
-  // Forward data: Serial2 -> GSM
-  while (Serial2.available()) {
-    Serial1.write(Serial2.read());
+  bool disconnected = false;
+bridgeReadFromModem_ToMeter(disconnected);
+
+
+  // Meter -> Modem (raw)
+  int size;
+  while ((size = Serial2.available()) > 0)
+  {
+    size = min(size, BUFFER_SIZE);
+    Serial2.readBytes(buff, size);
+    Serial1.write(buff, size);
   }
 
-  delay(10); // small delay
+  // If disconnect detected: STOP bridge. (NO AT CLOSE here!)
+  if (disconnected)
+  {
+    debug_log("CLIENT DISCONNECTED -> BRIDGE OFF (no AT close)");
+    bridgeOn = false;
+    urcLine = "";
+    // do NOT send AT+CIPCLOSE here (prevents AT text leaking to TCP)
+  }
 }
